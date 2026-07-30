@@ -49,6 +49,44 @@ def _find_anomalies(df: pd.DataFrame, col: str, window: int = 5,
 
 # ── 数据采集 ──────────────────────────────────────────────
 
+def fetch_index(symbol: str = "sh000001", start: str | None = None,
+                end: str | None = None) -> pd.DataFrame:
+    """大盘指数日线 (新浪源, 全历史, 无需 token); 返回 [date, index_close]"""
+    import akshare as ak
+    try:
+        df = ak.stock_zh_index_daily(symbol=symbol)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df[["date", "close"]].rename(columns={"close": "index_close"})
+        if start:
+            df = df[df["date"] >= pd.to_datetime(start)]
+        if end:
+            df = df[df["date"] <= pd.to_datetime(end)]
+        return df.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        print(f"⚠️  上证指数获取失败: {e}")
+        return pd.DataFrame(columns=["date", "index_close"])
+
+
+def print_correlation(df: pd.DataFrame) -> None:
+    """打印两融余额与上证指数的相关性 (水平值 + 日变动)"""
+    if "index_close" not in df.columns:
+        return
+    sub = df[["rzrqye_total", "index_close"]].dropna()
+    if len(sub) < 30:
+        return
+    r_level = sub["rzrqye_total"].corr(sub["index_close"])
+    r_diff = sub["rzrqye_total"].diff().corr(sub["index_close"].diff())
+    print(f"\n🔗 两融余额 vs 上证指数 相关性 (近 {len(sub)} 天):")
+    print(f"   水平值相关系数  = {r_level:+.3f}  (长期趋势共线性, 参考)")
+    print(f"   日变动相关系数  = {r_diff:+.3f}  (同涨同跌同步性, 更关键)")
+    if r_diff > 0.5:
+        print("   解读: 两融与大盘高度同向, 杠杆资金追涨/杀跌明显")
+    elif r_diff > 0.2:
+        print("   解读: 两融与大盘中度同向")
+    else:
+        print("   解读: 两融与大盘短期同步性弱, 杠杆资金相对独立")
+
+
 def fetch_jin10() -> tuple[pd.DataFrame, pd.DataFrame]:
     """主源: jin10 沪深两融全历史"""
     import akshare as ak
@@ -267,8 +305,9 @@ def merge_total(sh: pd.DataFrame, sz: pd.DataFrame,
 # ── 可视化 ────────────────────────────────────────────────
 
 
+
 def plot(df: pd.DataFrame, output_dir: Path) -> Path:
-    """三子图: 两融合计 / 融资 / 融券; X 轴按月标记; 峰值精确到天"""
+    """四子图: 两融合计 / 融资 / 融券 / 上证指数; X 轴按月; 峰值精确到天"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -280,11 +319,13 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
     dates = df["date"]
     y_total = df["rzrqye_total"] / 1e12   # 万亿
     y_rzye = df["rzye_total"] / 1e12      # 万亿
-    y_rqye = df["rqye_total"] / 1e8       # 亿 (融券量级小, 用亿更直观)
+    y_rqye = df["rqye_total"] / 1e8       # 亿
+    has_idx = "index_close" in df.columns and df["index_close"].notna().any()
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    n_panels = 4 if has_idx else 3
+    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.0 * n_panels), sharex=True)
 
-    # ── 子图0: 两融合计 (带区间带/峰值/当前) ──
+    # ── 子图0: 两融合计 ──
     ax = axes[0]
     ax.plot(dates, y_total, color="#e74c3c", linewidth=1.1, label="两融余额")
     p25, p75 = y_total.quantile(0.25), y_total.quantile(0.75)
@@ -331,14 +372,27 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
     ax.set_title("融券", fontsize=11, loc="left")
     ax.grid(True, alpha=0.25)
 
-    # ── X 轴: 按月标记 (每季度一刻度, 标签含月份, 旋转防重叠) ──
-    axes[2].xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    axes[2].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    plt.setp(axes[2].get_xticklabels(), rotation=45, ha="right", fontsize=8)
+    # ── 子图3: 上证指数 (可选) ──
+    if has_idx:
+        ax = axes[3]
+        y_idx = df["index_close"]
+        ax.plot(dates, y_idx, color="#8e44ad", linewidth=1.0, label="上证指数")
+        ax.scatter([dates.iloc[-1]], [y_idx.iloc[-1]], color="#8e44ad", zorder=5, s=30)
+        ax.annotate(f"{y_idx.iloc[-1]:.0f} 点",
+                    xy=(dates.iloc[-1], y_idx.iloc[-1]), xytext=(-62, 10),
+                    textcoords="offset points", fontsize=9, color="#8e44ad")
+        ax.set_ylabel("上证指数（点）", fontsize=10)
+        ax.set_title("上证指数", fontsize=11, loc="left")
+        ax.grid(True, alpha=0.25)
 
-    fig.suptitle("A 股杠杆水平：两融 / 融资 / 融券 余额走势",
-                 fontsize=13, fontweight="bold", y=0.995)
-    plt.tight_layout(rect=[0, 0, 1, 0.98])
+    # ── X 轴: 按月标记 ──
+    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    plt.setp(axes[-1].get_xticklabels(), rotation=45, ha="right", fontsize=8)
+
+    fig.suptitle("A 股杠杆水平：两融 / 融资 / 融券 / 上证指数 走势",
+                 fontsize=13, fontweight="bold", y=0.997)
+    plt.tight_layout(rect=[0, 0, 1, 0.985])
 
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "rzrq_leverage.png"
@@ -353,13 +407,19 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
 
 def save_csv(df: pd.DataFrame, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    out = df[["date", "rzye_sh", "rzye_sz", "rzye_total", "rqye_total",
-              "rzrqye_sh", "rzrqye_sz", "rzrqye_total"]].copy()
+    wanted = ["date", "rzye_sh", "rzye_sz", "rzye_total", "rqye_total",
+              "rzrqye_sh", "rzrqye_sz", "rzrqye_total", "index_close"]
+    out = df[[col for col in wanted if col in df.columns]].copy()
     out["date"] = out["date"].dt.strftime("%Y-%m-%d")
-    for c in out.columns[1:]:
-        out[c] = (out[c] / 1e8).round(2)
-    out.columns = ["日期", "沪市融资余额(亿)", "深市融资余额(亿)", "两市融资余额(亿)", "两市融券余额(亿)",
-                    "沪市两融余额(亿)", "深市两融余额(亿)", "两市两融余额(亿)"]
+    yuan_cols = [col for col in out.columns if col not in ("date", "index_close")]
+    out[yuan_cols] = (out[yuan_cols] / 1e8).round(2)
+    if "index_close" in out.columns:
+        out["index_close"] = out["index_close"].round(2)
+    hdr = {"date": "日期", "rzye_sh": "沪市融资余额(亿)", "rzye_sz": "深市融资余额(亿)",
+           "rzye_total": "两市融资余额(亿)", "rqye_total": "两市融券余额(亿)",
+           "rzrqye_sh": "沪市两融余额(亿)", "rzrqye_sz": "深市两融余额(亿)",
+           "rzrqye_total": "两市两融余额(亿)", "index_close": "上证指数(点)"}
+    out.columns = [hdr[col] for col in out.columns]
     path = output_dir / "rzrq_data.csv"
     out.to_csv(path, index=False, encoding="utf-8-sig")
     print(f"💾 数据 → {path}")
@@ -482,9 +542,18 @@ def main():
     if not args.no_validate:
         verify_with_csdata(df, days=5)
 
-    # 6) 落盘 + 画图
+    # 6) 合并大盘指数
+    idx = fetch_index("sh000001", args.start, args.end)
+    if not idx.empty:
+        df = df.merge(idx, on="date", how="left")
+        print(f"📈 上证指数已合并 ({idx['date'].min().date()} ~ {idx['date'].max().date()})")
+    else:
+        print("⚠️  上证指数缺失, 跳过")
+
+    # 7) 落盘 + 画图
     save_csv(df, output_dir)
     plot(df, output_dir)
+    print_correlation(df)
 
     # 7) 摘要
     cur = df["rzrqye_total"].iloc[-1] / 1e12
