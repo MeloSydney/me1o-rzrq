@@ -8,7 +8,7 @@ A股融资融券（两融）数据获取 + 交叉验证 + 杠杆趋势可视化
   验证  - 主源 vs 交易所 交叉对比
 
 用法:
-  python fetch_rzrq.py                     # 默认 2015-至今, 输出到 ./output
+  python fetch_rzrq.py                     # 默认 2015-至今, 输出到 /Users/melo/doc-Dgf/rzrq/MMDD (当天月日)
   python fetch_rzrq.py --start 2020-01-01  # 自定义起始
   python fetch_rzrq.py --output ~/Desktop  # 自定义输出目录
   python fetch_rzrq.py --no-validate       # 跳过交叉验证
@@ -430,7 +430,8 @@ def save_csv(df: pd.DataFrame, output_dir: Path) -> Path:
 
 # ── 中证数据验证 (追加到 main 流程) ──────────────────────
 
-def verify_with_csdata(df: pd.DataFrame, days: int = 5) -> pd.DataFrame | None:
+def verify_with_csdata(df: pd.DataFrame, days: int = 5,
+                       output_dir: Path | None = None) -> pd.DataFrame | None:
     """用中证数据做第三源验证 + 补充指标"""
     try:
         # 动态导入同目录下的 fetch_csdata
@@ -499,6 +500,13 @@ def verify_with_csdata(df: pd.DataFrame, days: int = 5) -> pd.DataFrame | None:
         else:
             print("  🟢 安全 (>2.5)")
 
+        # 中证数据落盘到本次输出目录 (MMDD)
+        if output_dir is not None:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            cs_path = output_dir / "csdata_rzrq.csv"
+            cs.to_csv(cs_path, index=False, encoding="utf-8-sig")
+            print(f"💾 中证数据已保存 → {cs_path}")
+
         return cs
     except Exception as e:
         print(f"⚠️  中证数据验证跳过: {e}")
@@ -540,7 +548,7 @@ def main():
 
     # 5) 中证数据验证 (第三源 + 补充指标)
     if not args.no_validate:
-        verify_with_csdata(df, days=5)
+        verify_with_csdata(df, days=5, output_dir=output_dir)
 
     # 6) 合并大盘指数
     idx = fetch_index("sh000001", args.start, args.end)

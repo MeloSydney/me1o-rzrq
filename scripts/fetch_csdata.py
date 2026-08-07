@@ -6,7 +6,7 @@
 提供 jin10 没有的关键指标：两融占流通市值比重、维持担保比例等。
 
 用法:
-  python fetch_csdata.py                  # 最近 5 个交易日
+  python fetch_csdata.py                  # 最近 5 个交易日, 保存到 /Users/melo/doc-Dgf/rzrq/MMDD (当天月日)
   python fetch_csdata.py --days 20        # 最近 20 个交易日
   python fetch_csdata.py --output ./data  # 自定义输出目录
 """
@@ -125,7 +125,9 @@ def fetch_csdata(days: int = 5) -> pd.DataFrame:
 def main():
     ap = argparse.ArgumentParser(description="中证监测融资融券数据获取")
     ap.add_argument("--days", type=int, default=5, help="最近 N 个交易日")
-    ap.add_argument("--output", default=None, help="输出 CSV 目录")
+    _default_out = f"/Users/melo/doc-Dgf/rzrq/{datetime.now().strftime('%m%d')}"
+    ap.add_argument("--output", default=_default_out,
+                    help=f"输出 CSV 目录 (默认按当天日期: {_default_out})")
     args = ap.parse_args()
 
     df = fetch_csdata(args.days)
@@ -135,12 +137,11 @@ def main():
     print(f"\n📋 数据预览:")
     print(df.to_string(index=False))
 
-    if args.output:
-        out_dir = Path(args.output)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / "csdata_rzrq.csv"
-        df.to_csv(path, index=False, encoding="utf-8-sig")
-        print(f"\n💾 保存 → {path}")
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "csdata_rzrq.csv"
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    print(f"\n💾 保存 → {path}")
 
 
 if __name__ == "__main__":

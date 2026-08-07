@@ -52,6 +52,9 @@ description: 获取A股融资融券（两融）数据并生成杠杆趋势折线
 
 ### 数据
 - `<output>/rzrq_data.csv` — 沪深两市逐日两融数据（亿元）
+- `<output>/csdata_rzrq.csv` — 中证监测补充指标（两融/流通市值比重、维持担保比例等，最近 5 个交易日）
+
+> 所有数据文件默认随本次运行落入当天 `MMDD` 目录；同一天多次运行会覆盖同名文件，历史日期目录不受影响。
 
 ### 终端摘要
 - 当前两融余额（万亿）、区间峰值、历史分位
@@ -83,6 +86,6 @@ description: 获取A股融资融券（两融）数据并生成杠杆趋势折线
 ## 独立使用中证数据脚本
 
 ```bash
-# 只拉中证数据（含维持担保比例等补充指标）
+# 只拉中证数据（含维持担保比例等补充指标），默认保存到 /Users/melo/doc-Dgf/rzrq/MMDD/csdata_rzrq.csv
 <skill-dir>/.venv/bin/python <skill-dir>/scripts/fetch_csdata.py --days 10
 ```
