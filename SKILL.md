@@ -89,3 +89,39 @@ description: 获取A股融资融券（两融）数据并生成杠杆趋势折线
 # 只拉中证数据（含维持担保比例等补充指标），默认保存到 /Users/melo/doc-Dgf/rzrq/MMDD/csdata_rzrq.csv
 <skill-dir>/.venv/bin/python <skill-dir>/scripts/fetch_csdata.py --days 10
 ```
+
+## 板块流向分析（fetch_sector.py）
+
+交易所只发布个股级两融明细，本脚本将其与申万一级行业成分股聚合为板块级统计（全部免费源）：
+
+- 个股明细：AKShare `stock_margin_detail_sse/szse`（交易所法定披露）
+- 行业分类：申万宏源一级行业成分股（本地缓存 7 天：`~/.cache/rzrq/sw_industry_map.csv`）
+- 验证源：东方财富 datacenter 个股两融（独立管道，`--validate` 开启）
+
+```bash
+# 最近交易日板块聚合 + 东财独立源交叉验证
+<skill-dir>/.venv/bin/python <skill-dir>/scripts/fetch_sector.py --validate
+
+# 指定日期 / 自定义输出 / 刷新行业缓存
+<skill-dir>/.venv/bin/python <skill-dir>/scripts/fetch_sector.py --date 2026-09-01 --output ~/Desktop --refresh-map
+```
+
+### 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--date` | 最近交易日 | 目标日期 YYYY-MM-DD |
+| `--output` | /Users/melo/doc-Dgf/rzrq/MMDD | 输出目录 |
+| `--validate` | false | 用东财独立源逐股交叉验证融资余额 |
+| `--refresh-map` | false | 强制刷新申万成分股缓存 |
+
+### 输出
+
+- `<output>/rzrq_by_sector.csv` — 申万一级聚合表（余额亿 / 净买入亿 / 标的数 / 占比%）
+- 终端摘要：个股 vs ETF 结构、当日毛流入/净变动、余额 TOP10 行业、净流入/流出 TOP5
+
+### 口径说明
+
+- 融资余额为**存量**；净买入 = 当日余额 − 前一交易日余额（近似流量）
+- ETF/基金（代码前缀 51/56/58/15/16/18）单独统计，不计入行业聚合（多为对冲/套利仓）
+- `--validate` 预期结果：匹配率 100%、偏差中位 0.000%（东财与交易所同源法定数据，验证的是解析/聚合管道）
