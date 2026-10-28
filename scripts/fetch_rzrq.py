@@ -15,11 +15,18 @@ A股融资融券（两融）数据获取 + 交叉验证 + 杠杆趋势可视化
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+from financing_warning import (
+    add_warning_indicators,
+    print_financing_warning,
+    save_warning_outputs,
+)
 
 
 # ── 工具函数 ──────────────────────────────────────────────
@@ -50,41 +57,44 @@ def _find_anomalies(df: pd.DataFrame, col: str, window: int = 5,
 # ── 数据采集 ──────────────────────────────────────────────
 
 def fetch_index(symbol: str = "sh000001", start: str | None = None,
-                end: str | None = None) -> pd.DataFrame:
-    """大盘指数日线 (新浪源, 全历史, 无需 token); 返回 [date, index_close]"""
+                end: str | None = None, output_col: str = "index_close",
+                display_name: str = "上证指数") -> pd.DataFrame:
+    """指数日线 (新浪源, 全历史, 无需 token); 返回 [date, output_col]"""
     import akshare as ak
     try:
         df = ak.stock_zh_index_daily(symbol=symbol)
         df["date"] = pd.to_datetime(df["date"])
-        df = df[["date", "close"]].rename(columns={"close": "index_close"})
+        df = df[["date", "close"]].rename(columns={"close": output_col})
         if start:
             df = df[df["date"] >= pd.to_datetime(start)]
         if end:
             df = df[df["date"] <= pd.to_datetime(end)]
         return df.sort_values("date").reset_index(drop=True)
     except Exception as e:
-        print(f"⚠️  上证指数获取失败: {e}")
-        return pd.DataFrame(columns=["date", "index_close"])
+        print(f"⚠️  {display_name}获取失败: {e}")
+        return pd.DataFrame(columns=["date", output_col])
 
 
 def print_correlation(df: pd.DataFrame) -> None:
-    """打印两融余额与上证指数的相关性 (水平值 + 日变动)"""
-    if "index_close" not in df.columns:
-        return
-    sub = df[["rzrqye_total", "index_close"]].dropna()
-    if len(sub) < 30:
-        return
-    r_level = sub["rzrqye_total"].corr(sub["index_close"])
-    r_diff = sub["rzrqye_total"].diff().corr(sub["index_close"].diff())
-    print(f"\n🔗 两融余额 vs 上证指数 相关性 (近 {len(sub)} 天):")
-    print(f"   水平值相关系数  = {r_level:+.3f}  (长期趋势共线性, 参考)")
-    print(f"   日变动相关系数  = {r_diff:+.3f}  (同涨同跌同步性, 更关键)")
-    if r_diff > 0.5:
-        print("   解读: 两融与大盘高度同向, 杠杆资金追涨/杀跌明显")
-    elif r_diff > 0.2:
-        print("   解读: 两融与大盘中度同向")
-    else:
-        print("   解读: 两融与大盘短期同步性弱, 杠杆资金相对独立")
+    """打印融资余额与上证指数、科创50的相关性 (水平值 + 日变动)。"""
+    targets = [("index_close", "上证指数"), ("star50_close", "科创50")]
+    for col, label in targets:
+        if col not in df.columns:
+            continue
+        sub = df[["rzye_total", col]].dropna()
+        if len(sub) < 30:
+            continue
+        r_level = sub["rzye_total"].corr(sub[col])
+        r_diff = sub["rzye_total"].diff().corr(sub[col].diff())
+        print(f"\n🔗 融资余额 vs {label} 相关性 (近 {len(sub)} 天):")
+        print(f"   水平值相关系数  = {r_level:+.3f}  (长期趋势共线性, 参考)")
+        print(f"   日变动相关系数  = {r_diff:+.3f}  (同涨同跌同步性, 更关键)")
+        if r_diff > 0.5:
+            print(f"   解读: 融资与{label}高度同向, 杠杆资金追涨/杀跌明显")
+        elif r_diff > 0.2:
+            print(f"   解读: 融资与{label}中度同向")
+        else:
+            print(f"   解读: 融资与{label}短期同步性弱")
 
 
 def fetch_jin10() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -307,98 +317,116 @@ def merge_total(sh: pd.DataFrame, sz: pd.DataFrame,
 
 
 def plot(df: pd.DataFrame, output_dir: Path) -> Path:
-    """四子图: 两融合计 / 融资 / 融券 / 上证指数; X 轴按月; 峰值精确到天"""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
+    """最近三年三子图交互式 HTML: 两融合计 / 融资-科创50 / 融资-上证指数。
 
-    plt.rcParams["font.sans-serif"] = ["PingFang SC", "Heiti SC", "Arial Unicode MS", "SimHei"]
-    plt.rcParams["axes.unicode_minus"] = False
+    鼠标悬停某日期时，同一浮窗显示当日全部曲线精确数值（hovermode=x unified）。
+    自包含单文件：内嵌 plotly.js，离线可用。不绘制融券子图与预警散点。
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-    dates = df["date"]
-    y_total = df["rzrqye_total"] / 1e12   # 万亿
-    y_rzye = df["rzye_total"] / 1e12      # 万亿
-    y_rqye = df["rqye_total"] / 1e8       # 亿
-    has_idx = "index_close" in df.columns and df["index_close"].notna().any()
+    latest_date = pd.to_datetime(df["date"]).max()
+    chart_start = latest_date - pd.DateOffset(years=3)
+    chart_df = df[pd.to_datetime(df["date"]) >= chart_start].copy()
+    chart_df = chart_df.sort_values("date").reset_index(drop=True)
+    chart_df["date"] = pd.to_datetime(chart_df["date"])
+    dates = chart_df["date"]
+    y_total = chart_df["rzrqye_total"] / 1e12   # 万亿
+    y_rzye = chart_df["rzye_total"] / 1e12      # 万亿
+    x0, x1 = chart_start, latest_date
 
-    n_panels = 4 if has_idx else 3
-    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.0 * n_panels), sharex=True)
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        vertical_spacing=0.09,
+        specs=[[{"secondary_y": False}],
+               [{"secondary_y": True}],
+               [{"secondary_y": True}]],
+        subplot_titles=("两融合计", "融资余额 vs 科创50", "融资余额 vs 上证指数"),
+    )
 
-    # ── 子图0: 两融合计 ──
-    ax = axes[0]
-    ax.plot(dates, y_total, color="#e74c3c", linewidth=1.1, label="两融余额")
-    p25, p75 = y_total.quantile(0.25), y_total.quantile(0.75)
-    ax.axhspan(p25, p75, color="#3498db", alpha=0.07,
-               label=f"25%–75% 区间 ({p25:.2f}–{p75:.2f} 万亿)")
-    peak_val, peak_idx = y_total.max(), y_total.idxmax()
-    peak_date = dates[peak_idx]
-    ax.axhline(peak_val, color="gray", ls="--", lw=0.8, alpha=0.6)
-    ax.annotate(f"峰值 {peak_val:.2f} 万亿 ({peak_date:%Y-%m-%d})",
-                xy=(peak_date, peak_val), xytext=(-8, 14), ha="right",
-                textcoords="offset points", fontsize=9, color="gray",
-                arrowprops=dict(arrowstyle="->", color="gray", lw=0.8))
-    cur_val = y_total.iloc[-1]
-    ax.scatter([dates.iloc[-1]], [cur_val], color="#e74c3c", zorder=5, s=45)
-    ax.annotate(f"当前 {cur_val:.2f} 万亿",
-                xy=(dates.iloc[-1], cur_val), xytext=(-90, -28),
-                textcoords="offset points", fontsize=10, fontweight="bold",
-                color="#e74c3c",
-                arrowprops=dict(arrowstyle="->", color="#e74c3c", lw=1))
-    ax.set_ylabel("两融余额（万亿元）", fontsize=10)
-    ax.set_title("两融合计", fontsize=11, loc="left")
-    ax.legend(loc="upper left", fontsize=8)
-    ax.grid(True, alpha=0.25)
+    # ── 子图1: 两融合计 ──
+    p25, p75 = float(y_total.quantile(0.25)), float(y_total.quantile(0.75))
+    fig.add_trace(
+        go.Scatter(x=dates, y=y_total, mode="lines", name="两融余额",
+                   line=dict(color="#e74c3c", width=1.4),
+                   hovertemplate="两融余额 %{y:.2f} 万亿<extra></extra>"),
+        row=1, col=1, secondary_y=False)
+    # 25%–75% 区间带
+    fig.add_shape(type="rect", x0=x0, x1=x1, y0=p25, y1=p75,
+                  fillcolor="rgba(52,152,219,0.10)", line_width=0, layer="below",
+                  row=1, col=1)
+    fig.add_annotation(x=x1, y=p75, text=f"25%–75% ({p25:.2f}–{p75:.2f} 万亿)",
+                       xanchor="right", yanchor="bottom", showarrow=False,
+                       font=dict(size=10, color="#3498db"), row=1, col=1)
+    # 峰值水平虚线 + 标注
+    peak_val, peak_idx = float(y_total.max()), int(y_total.idxmax())
+    peak_date = dates.iloc[peak_idx]
+    fig.add_shape(type="line", x0=x0, x1=x1, y0=peak_val, y1=peak_val,
+                  line=dict(color="gray", width=1, dash="dash"), layer="below",
+                  row=1, col=1)
+    fig.add_annotation(x=peak_date, y=peak_val,
+                       text=f"峰值 {peak_val:.2f} 万亿 ({peak_date:%Y-%m-%d})",
+                       showarrow=True, arrowhead=2, arrowsize=0.6,
+                       arrowcolor="gray", font=dict(size=11, color="gray"),
+                       row=1, col=1)
+    # 当前点
+    cur_val = float(y_total.iloc[-1])
+    fig.add_trace(go.Scatter(x=[dates.iloc[-1]], y=[cur_val], mode="markers",
+                             name="当前", marker=dict(color="#e74c3c", size=8),
+                             hovertemplate=f"当前 {cur_val:.2f} 万亿<extra></extra>",
+                             showlegend=False),
+                  row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="两融余额（万亿元）", row=1, col=1)
 
-    # ── 子图1: 融资 ──
-    ax = axes[1]
-    ax.plot(dates, y_rzye, color="#2980b9", linewidth=1.0, label="融资余额")
-    ax.scatter([dates.iloc[-1]], [y_rzye.iloc[-1]], color="#2980b9", zorder=5, s=30)
-    ax.annotate(f"{y_rzye.iloc[-1]:.2f} 万亿",
-                xy=(dates.iloc[-1], y_rzye.iloc[-1]), xytext=(-72, 10),
-                textcoords="offset points", fontsize=9, color="#2980b9")
-    ax.set_ylabel("融资余额（万亿元）", fontsize=10)
-    ax.set_title("融资", fontsize=11, loc="left")
-    ax.grid(True, alpha=0.25)
+    # ── 子图2/3: 融资 vs 指数（独立双 Y 轴）──
+    def add_financing_vs_index(row: int, index_col: str, index_label: str,
+                               index_color: str) -> None:
+        """融资余额（左轴蓝）与单一指数（右轴独立色）双 Y 轴叠加。"""
+        fig.add_trace(
+            go.Scatter(x=dates, y=y_rzye, mode="lines", name="融资余额",
+                       line=dict(color="#2980b9", width=1.4),
+                       hovertemplate="融资余额 %{y:.2f} 万亿<extra></extra>",
+                       showlegend=(row == 2)),
+            row=row, col=1, secondary_y=False)
+        fig.add_trace(go.Scatter(x=[dates.iloc[-1]], y=[float(y_rzye.iloc[-1])],
+                                 mode="markers", marker=dict(color="#2980b9", size=7),
+                                 hovertemplate=f"融资 {y_rzye.iloc[-1]:.2f} 万亿<extra></extra>",
+                                 showlegend=False),
+                      row=row, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="融资余额（万亿元）", color="#2980b9",
+                         row=row, col=1, secondary_y=False)
+        if index_col in chart_df.columns and chart_df[index_col].notna().any():
+            values = chart_df[index_col]
+            fig.add_trace(
+                go.Scatter(x=dates, y=values, mode="lines", name=index_label,
+                           line=dict(color=index_color, width=1.3),
+                           hovertemplate=f"{index_label} %{{y:.0f}} 点<extra></extra>"),
+                row=row, col=1, secondary_y=True)
+            fig.add_trace(go.Scatter(x=[dates.iloc[-1]], y=[float(values.iloc[-1])],
+                                     mode="markers", marker=dict(color=index_color, size=7),
+                                     hovertemplate=f"{index_label} {values.iloc[-1]:.0f} 点<extra></extra>",
+                                     showlegend=False),
+                          row=row, col=1, secondary_y=True)
+            fig.update_yaxes(title_text=f"{index_label}（点）", color=index_color,
+                             row=row, col=1, secondary_y=True)
 
-    # ── 子图2: 融券 ──
-    ax = axes[2]
-    ax.plot(dates, y_rqye, color="#27ae60", linewidth=1.0, label="融券余额")
-    ax.scatter([dates.iloc[-1]], [y_rqye.iloc[-1]], color="#27ae60", zorder=5, s=30)
-    ax.annotate(f"{y_rqye.iloc[-1]:.0f} 亿",
-                xy=(dates.iloc[-1], y_rqye.iloc[-1]), xytext=(-58, 10),
-                textcoords="offset points", fontsize=9, color="#27ae60")
-    ax.set_ylabel("融券余额（亿元）", fontsize=10)
-    ax.set_title("融券", fontsize=11, loc="left")
-    ax.grid(True, alpha=0.25)
+    add_financing_vs_index(2, "star50_close", "科创50", "#e67e22")
+    add_financing_vs_index(3, "index_close", "上证指数", "#8e44ad")
 
-    # ── 子图3: 上证指数 (可选) ──
-    if has_idx:
-        ax = axes[3]
-        y_idx = df["index_close"]
-        ax.plot(dates, y_idx, color="#8e44ad", linewidth=1.0, label="上证指数")
-        ax.scatter([dates.iloc[-1]], [y_idx.iloc[-1]], color="#8e44ad", zorder=5, s=30)
-        ax.annotate(f"{y_idx.iloc[-1]:.0f} 点",
-                    xy=(dates.iloc[-1], y_idx.iloc[-1]), xytext=(-62, 10),
-                    textcoords="offset points", fontsize=9, color="#8e44ad")
-        ax.set_ylabel("上证指数（点）", fontsize=10)
-        ax.set_title("上证指数", fontsize=11, loc="left")
-        ax.grid(True, alpha=0.25)
-
-    # ── X 轴: 按月标记 ──
-    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    plt.setp(axes[-1].get_xticklabels(), rotation=45, ha="right", fontsize=8)
-
-    fig.suptitle("A 股杠杆水平：两融 / 融资 / 融券 / 上证指数 走势",
-                 fontsize=13, fontweight="bold", y=0.997)
-    plt.tight_layout(rect=[0, 0, 1, 0.985])
+    # ── 布局：最近三年逐月 X 轴，悬停统一浮窗 ──
+    fig.update_layout(
+        title_text="A 股杠杆水平：最近三年融资分别对照科创50与上证指数",
+        title_font_size=15, hovermode="x unified", height=820,
+        legend=dict(orientation="h", xanchor="left", yanchor="bottom"),
+        margin=dict(l=60, r=60, t=80, b=40), plot_bgcolor="white",
+    )
+    fig.update_xaxes(range=[x0, x1], dtick="M1", tickformat="%Y-%m", tickangle=-60)
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(0,0,0,0.08)")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / "rzrq_leverage.png"
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"📊 图表 → {path}")
+    path = output_dir / "rzrq_leverage.html"
+    fig.write_html(str(path), include_plotlyjs=True, full_html=True)
+    print(f"📊 交互图表 → {path}")
     return path
 
 
@@ -408,17 +436,21 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
 def save_csv(df: pd.DataFrame, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     wanted = ["date", "rzye_sh", "rzye_sz", "rzye_total", "rqye_total",
-              "rzrqye_sh", "rzrqye_sz", "rzrqye_total", "index_close"]
+              "rzrqye_sh", "rzrqye_sz", "rzrqye_total", "index_close",
+              "star50_close"]
     out = df[[col for col in wanted if col in df.columns]].copy()
     out["date"] = out["date"].dt.strftime("%Y-%m-%d")
-    yuan_cols = [col for col in out.columns if col not in ("date", "index_close")]
+    index_cols = ("index_close", "star50_close")
+    yuan_cols = [col for col in out.columns if col not in ("date", *index_cols)]
     out[yuan_cols] = (out[yuan_cols] / 1e8).round(2)
-    if "index_close" in out.columns:
-        out["index_close"] = out["index_close"].round(2)
+    for col in index_cols:
+        if col in out.columns:
+            out[col] = out[col].round(2)
     hdr = {"date": "日期", "rzye_sh": "沪市融资余额(亿)", "rzye_sz": "深市融资余额(亿)",
            "rzye_total": "两市融资余额(亿)", "rqye_total": "两市融券余额(亿)",
            "rzrqye_sh": "沪市两融余额(亿)", "rzrqye_sz": "深市两融余额(亿)",
-           "rzrqye_total": "两市两融余额(亿)", "index_close": "上证指数(点)"}
+           "rzrqye_total": "两市两融余额(亿)", "index_close": "上证指数(点)",
+           "star50_close": "科创50指数(点)"}
     out.columns = [hdr[col] for col in out.columns]
     path = output_dir / "rzrq_data.csv"
     out.to_csv(path, index=False, encoding="utf-8-sig")
@@ -547,23 +579,53 @@ def main():
             print(f"⚠️  验证源失败 (不影响主数据): {e}")
 
     # 5) 中证数据验证 (第三源 + 补充指标)
+    csdata_df = None
     if not args.no_validate:
-        verify_with_csdata(df, days=5, output_dir=output_dir)
+        csdata_df = verify_with_csdata(df, days=5, output_dir=output_dir)
 
-    # 6) 合并大盘指数
-    idx = fetch_index("sh000001", args.start, args.end)
+    # 6) 合并上证指数与科创50指数
+    idx = fetch_index("sh000001", args.start, args.end,
+                      output_col="index_close", display_name="上证指数")
     if not idx.empty:
         df = df.merge(idx, on="date", how="left")
         print(f"📈 上证指数已合并 ({idx['date'].min().date()} ~ {idx['date'].max().date()})")
     else:
         print("⚠️  上证指数缺失, 跳过")
 
-    # 7) 落盘 + 画图
+    star50 = fetch_index("sh000688", args.start, args.end,
+                         output_col="star50_close", display_name="科创50")
+    if not star50.empty:
+        df = df.merge(star50, on="date", how="left")
+        print(f"📈 科创50已合并 ({star50['date'].min().date()} ~ {star50['date'].max().date()})")
+    else:
+        print("⚠️  科创50缺失, 跳过")
+
+    # 7) 计算融资暴跌模板预警，落盘并画图
+    df = add_warning_indicators(df)
     save_csv(df, output_dir)
+    warning_template, warning_summary = save_warning_outputs(df, output_dir, csdata=csdata_df)
+    if warning_template is not None:
+        print(f"💾 2026 暴跌模板 → {warning_template}")
+    print(f"💾 预警摘要 → {warning_summary}")
+    advisory = json.loads(warning_summary.read_text(encoding="utf-8")).get("csdata_advisory")
+    if advisory:
+        print(
+            f"🧭 中证数据建议修正：{advisory['base_warning_code']} "
+            f"{advisory['suggested_adjustment']:+d} → {advisory['adjusted_warning_code']} "
+            f"({advisory['adjusted_warning_level']})"
+        )
+        print(f"   理由：{advisory['adjustment_reason']}")
+        print(f"   存量口径：两融/流通市值 {advisory['rzrq_ratio_pct']:.2f}% {advisory['rzrq_ratio_level']}"
+              f" | 维持担保比例 {advisory['avg_maintain_ratio']}")
+        print(f"   增量口径：两融交易额占比 {advisory['rzrq_trade_ratio_pct']}%"
+              f"（窗口内 {advisory['rzrq_trade_ratio_trend']}"
+              f" {advisory['rzrq_trade_ratio_change_pp']}pp）"
+              f" | 融资净买入 {advisory['net_financing_buy_yi']} 亿")
     plot(df, output_dir)
     print_correlation(df)
+    print_financing_warning(df)
 
-    # 7) 摘要
+    # 8) 摘要
     cur = df["rzrqye_total"].iloc[-1] / 1e12
     peak = df["rzrqye_total"].max() / 1e12
     pct_rank = (df["rzrqye_total"] <= df["rzrqye_total"].iloc[-1]).mean() * 100
