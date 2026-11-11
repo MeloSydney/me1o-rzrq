@@ -22,11 +22,37 @@ from pathlib import Path
 
 import pandas as pd
 
-from financing_warning import (
-    add_warning_indicators,
-    print_financing_warning,
-    save_warning_outputs,
-)
+# ── 简单指标计算 ──────────────────────────────────────────
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """计算融资动量、回撤、分位和指数变化率等简单指标（不做分类/预警）。"""
+    required = {"date", "rzye_total"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"缺少字段: {', '.join(sorted(missing))}")
+
+    out = df.copy().sort_values("date").reset_index(drop=True)
+    out["date"] = pd.to_datetime(out["date"])
+    financing = pd.to_numeric(out["rzye_total"], errors="coerce")
+
+    for days in (5, 10, 20):
+        out[f"financing_change_{days}d_pct"] = financing.pct_change(days) * 100
+
+    high60 = financing.rolling(60, min_periods=20).max()
+    out["financing_drawdown_60d_pct"] = (financing / high60 - 1) * 100
+    out["financing_percentile_252d"] = financing.rolling(
+        252, min_periods=60
+    ).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False)
+
+    if "index_close" in out.columns:
+        index = pd.to_numeric(out["index_close"], errors="coerce")
+        out["index_change_5d_pct"] = index.pct_change(5) * 100
+        out["index_change_20d_pct"] = index.pct_change(20) * 100
+    else:
+        out["index_change_5d_pct"] = float("nan")
+        out["index_change_20d_pct"] = float("nan")
+
+    return out
 
 
 # ── 工具函数 ──────────────────────────────────────────────
@@ -259,6 +285,50 @@ def fix_merged(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── csdata 尾部补全 ────────────────────────────────────────
+
+def fill_tail_with_csdata(df: pd.DataFrame,
+                           csdata_df: pd.DataFrame | None) -> pd.DataFrame:
+    """主源 (jin10) 有 1-3 日延迟时，用中证数据补全末尾缺失的交易日。
+
+    中证数据只有两市合计，无沪/深拆分；补入行的 per-market 列为 NaN。
+    """
+    if csdata_df is None or csdata_df.empty:
+        return df
+
+    cs = csdata_df.copy()
+    cs["date"] = pd.to_datetime(cs["date"])
+    main_max = pd.to_datetime(df["date"]).max()
+
+    # 找出中证数据中比主源最新日期还晚的交易日
+    missing = cs[cs["date"] > main_max].sort_values("date")
+    if missing.empty:
+        return df
+
+    rows = []
+    for _, cs_row in missing.iterrows():
+        rows.append({
+            "date": cs_row["date"],
+            "rzye_sh": float("nan"),
+            "rzye_sz": float("nan"),
+            "rzye_total": float(cs_row["rzye"]) * 1e8,
+            "rqye_total": float(cs_row["rqye"]) * 1e8,
+            "rzrqye_sh": float("nan"),
+            "rzrqye_sz": float("nan"),
+            "rzrqye_total": float(cs_row["rzrqye"]) * 1e8,
+        })
+
+    patch = pd.DataFrame(rows)
+    df = pd.concat([df, patch], ignore_index=True)
+    df = df.sort_values("date").reset_index(drop=True)
+
+    print(f"🔧 [csdata补全] 主源缺失末尾 {len(rows)} 个交易日, 已用中证数据补入:")
+    for r in rows:
+        print(f"   ✅ {r['date'].date()}: 融资余额={r['rzye_total']/1e8:.2f}亿 "
+              f"两融余额={r['rzrqye_total']/1e8:.2f}亿")
+    return df
+
+
 # ── 交叉验证 ──────────────────────────────────────────────
 
 def cross_validate(jin10_sh: pd.DataFrame, start: str, end: str,
@@ -317,9 +387,10 @@ def merge_total(sh: pd.DataFrame, sz: pd.DataFrame,
 
 
 def plot(df: pd.DataFrame, output_dir: Path) -> Path:
-    """最近三年三子图交互式 HTML: 两融合计 / 融资-科创50 / 融资-上证指数。
+    """最近三年四子图交互式 HTML: 两融合计 / 融资余额 / 科创50 / 上证指数。
 
-    鼠标悬停某日期时，同一浮窗显示当日全部曲线精确数值（hovermode=x unified）。
+    融资与指数拆成上下对齐的独立子图，避免双 Y 轴自动缩放造成视觉误读。
+    鼠标悬停某日期时，沿共享 X 轴显示各子图的精确数值。
     自包含单文件：内嵌 plotly.js，离线可用。不绘制融券子图与预警散点。
     """
     import plotly.graph_objects as go
@@ -336,12 +407,10 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
     x0, x1 = chart_start, latest_date
 
     fig = make_subplots(
-        rows=3, cols=1, shared_xaxes=True,
-        vertical_spacing=0.09,
-        specs=[[{"secondary_y": False}],
-               [{"secondary_y": True}],
-               [{"secondary_y": True}]],
-        subplot_titles=("两融合计", "融资余额 vs 科创50", "融资余额 vs 上证指数"),
+        rows=4, cols=1, shared_xaxes=True,
+        vertical_spacing=0.065,
+        row_heights=[0.30, 0.24, 0.22, 0.24],
+        subplot_titles=("两融合计", "融资余额", "科创50", "上证指数"),
     )
 
     # ── 子图1: 两融合计 ──
@@ -378,47 +447,41 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
                   row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="两融余额（万亿元）", row=1, col=1)
 
-    # ── 子图2/3: 融资 vs 指数（独立双 Y 轴）──
-    def add_financing_vs_index(row: int, index_col: str, index_label: str,
-                               index_color: str) -> None:
-        """融资余额（左轴蓝）与单一指数（右轴独立色）双 Y 轴叠加。"""
+    # ── 子图2: 融资余额；子图3/4: 两个指数（独立上下子图）──
+    def add_series(row: int, values: pd.Series, name: str, color: str,
+                   axis_title: str, hovertemplate: str) -> None:
+        """在独立子图绘制一条序列及其当前点。"""
+        valid = values.notna()
+        if not valid.any():
+            return
         fig.add_trace(
-            go.Scatter(x=dates, y=y_rzye, mode="lines", name="融资余额",
-                       line=dict(color="#2980b9", width=1.4),
-                       hovertemplate="融资余额 %{y:.2f} 万亿<extra></extra>",
-                       showlegend=(row == 2)),
-            row=row, col=1, secondary_y=False)
-        fig.add_trace(go.Scatter(x=[dates.iloc[-1]], y=[float(y_rzye.iloc[-1])],
-                                 mode="markers", marker=dict(color="#2980b9", size=7),
-                                 hovertemplate=f"融资 {y_rzye.iloc[-1]:.2f} 万亿<extra></extra>",
-                                 showlegend=False),
-                      row=row, col=1, secondary_y=False)
-        fig.update_yaxes(title_text="融资余额（万亿元）", color="#2980b9",
-                         row=row, col=1, secondary_y=False)
-        if index_col in chart_df.columns and chart_df[index_col].notna().any():
-            values = chart_df[index_col]
-            fig.add_trace(
-                go.Scatter(x=dates, y=values, mode="lines", name=index_label,
-                           line=dict(color=index_color, width=1.3),
-                           hovertemplate=f"{index_label} %{{y:.0f}} 点<extra></extra>"),
-                row=row, col=1, secondary_y=True)
-            fig.add_trace(go.Scatter(x=[dates.iloc[-1]], y=[float(values.iloc[-1])],
-                                     mode="markers", marker=dict(color=index_color, size=7),
-                                     hovertemplate=f"{index_label} {values.iloc[-1]:.0f} 点<extra></extra>",
-                                     showlegend=False),
-                          row=row, col=1, secondary_y=True)
-            fig.update_yaxes(title_text=f"{index_label}（点）", color=index_color,
-                             row=row, col=1, secondary_y=True)
+            go.Scatter(x=dates[valid], y=values[valid], mode="lines", name=name,
+                       line=dict(color=color, width=1.4),
+                       hovertemplate=hovertemplate),
+            row=row, col=1)
+        last_idx = values[valid].index[-1]
+        fig.add_trace(
+            go.Scatter(x=[dates.loc[last_idx]], y=[float(values.loc[last_idx])],
+                       mode="markers", marker=dict(color=color, size=7),
+                       hovertemplate=hovertemplate, showlegend=False),
+            row=row, col=1)
+        fig.update_yaxes(title_text=axis_title, color=color, row=row, col=1)
 
-    add_financing_vs_index(2, "star50_close", "科创50", "#e67e22")
-    add_financing_vs_index(3, "index_close", "上证指数", "#8e44ad")
+    add_series(2, y_rzye, "融资余额", "#2980b9",
+               "融资余额（万亿元）", "融资余额 %{y:.2f} 万亿<extra></extra>")
+    if "star50_close" in chart_df.columns:
+        add_series(3, chart_df["star50_close"], "科创50", "#e67e22",
+                   "科创50（点）", "科创50 %{y:.0f} 点<extra></extra>")
+    if "index_close" in chart_df.columns:
+        add_series(4, chart_df["index_close"], "上证指数", "#8e44ad",
+                   "上证指数（点）", "上证指数 %{y:.0f} 点<extra></extra>")
 
-    # ── 布局：最近三年逐月 X 轴，悬停统一浮窗 ──
+    # ── 布局：最近三年逐月 X 轴，共享日期悬停 ──
     fig.update_layout(
-        title_text="A 股杠杆水平：最近三年融资分别对照科创50与上证指数",
-        title_font_size=15, hovermode="x unified", height=820,
+        title_text="A 股杠杆水平：融资余额与科创50、上证指数分图对照",
+        title_font_size=15, hovermode="x unified", hoversubplots="axis", height=980,
         legend=dict(orientation="h", xanchor="left", yanchor="bottom"),
-        margin=dict(l=60, r=60, t=80, b=40), plot_bgcolor="white",
+        margin=dict(l=70, r=35, t=80, b=40), plot_bgcolor="white",
     )
     fig.update_xaxes(range=[x0, x1], dtick="M1", tickformat="%Y-%m", tickangle=-60)
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(0,0,0,0.08)")
@@ -437,20 +500,39 @@ def save_csv(df: pd.DataFrame, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     wanted = ["date", "rzye_sh", "rzye_sz", "rzye_total", "rqye_total",
               "rzrqye_sh", "rzrqye_sz", "rzrqye_total", "index_close",
-              "star50_close"]
+              "star50_close",
+              "financing_change_5d_pct", "financing_change_10d_pct",
+              "financing_change_20d_pct", "financing_drawdown_60d_pct",
+              "financing_percentile_252d", "index_change_5d_pct",
+              "index_change_20d_pct"]
     out = df[[col for col in wanted if col in df.columns]].copy()
     out["date"] = out["date"].dt.strftime("%Y-%m-%d")
     index_cols = ("index_close", "star50_close")
-    yuan_cols = [col for col in out.columns if col not in ("date", *index_cols)]
+    pct_cols = ("financing_change_5d_pct", "financing_change_10d_pct",
+                "financing_change_20d_pct", "financing_drawdown_60d_pct",
+                "financing_percentile_252d", "index_change_5d_pct",
+                "index_change_20d_pct")
+    yuan_cols = [col for col in out.columns
+                 if col not in ("date", *index_cols, *pct_cols)]
     out[yuan_cols] = (out[yuan_cols] / 1e8).round(2)
     for col in index_cols:
         if col in out.columns:
             out[col] = out[col].round(2)
+    for col in pct_cols:
+        if col in out.columns:
+            out[col] = out[col].round(4)
     hdr = {"date": "日期", "rzye_sh": "沪市融资余额(亿)", "rzye_sz": "深市融资余额(亿)",
            "rzye_total": "两市融资余额(亿)", "rqye_total": "两市融券余额(亿)",
            "rzrqye_sh": "沪市两融余额(亿)", "rzrqye_sz": "深市两融余额(亿)",
            "rzrqye_total": "两市两融余额(亿)", "index_close": "上证指数(点)",
-           "star50_close": "科创50指数(点)"}
+           "star50_close": "科创50指数(点)",
+           "financing_change_5d_pct": "融资5日变化率(%)",
+           "financing_change_10d_pct": "融资10日变化率(%)",
+           "financing_change_20d_pct": "融资20日变化率(%)",
+           "financing_drawdown_60d_pct": "融资60日回撤(%)",
+           "financing_percentile_252d": "融资252日分位",
+           "index_change_5d_pct": "上证5日变化率(%)",
+           "index_change_20d_pct": "上证20日变化率(%)"}
     out.columns = [hdr[col] for col in out.columns]
     path = output_dir / "rzrq_data.csv"
     out.to_csv(path, index=False, encoding="utf-8-sig")
@@ -581,7 +663,25 @@ def main():
     # 5) 中证数据验证 (第三源 + 补充指标)
     csdata_df = None
     if not args.no_validate:
-        csdata_df = verify_with_csdata(df, days=5, output_dir=output_dir)
+        csdata_df = verify_with_csdata(df, days=10, output_dir=output_dir)
+
+    # 5.5) 用中证数据补全主源末尾缺失的交易日 (jin10 通常延迟 1-3 日)
+    # live fetch 失败时回退到最近的 csdata_rzrq.csv 缓存
+    if csdata_df is None and not args.no_validate:
+        cached = output_dir / "csdata_rzrq.csv"
+        if not cached.is_file():
+            # 搜索同级目录下最近的 csdata 缓存
+            parent = output_dir.parent
+            candidates = sorted(parent.glob("*/csdata_rzrq.csv"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                cached = candidates[0]
+        if cached.is_file():
+            print(f"⚠️  中证 live fetch 失败, 回退缓存: {cached}")
+            csdata_df = pd.read_csv(cached, encoding="utf-8-sig")
+
+    if csdata_df is not None:
+        df = fill_tail_with_csdata(df, csdata_df)
 
     # 6) 合并上证指数与科创50指数
     idx = fetch_index("sh000001", args.start, args.end,
@@ -600,30 +700,11 @@ def main():
     else:
         print("⚠️  科创50缺失, 跳过")
 
-    # 7) 计算融资暴跌模板预警，落盘并画图
-    df = add_warning_indicators(df)
+    # 7) 计算简单指标，落盘并画图
+    df = add_indicators(df)
     save_csv(df, output_dir)
-    warning_template, warning_summary = save_warning_outputs(df, output_dir, csdata=csdata_df)
-    if warning_template is not None:
-        print(f"💾 2026 暴跌模板 → {warning_template}")
-    print(f"💾 预警摘要 → {warning_summary}")
-    advisory = json.loads(warning_summary.read_text(encoding="utf-8")).get("csdata_advisory")
-    if advisory:
-        print(
-            f"🧭 中证数据建议修正：{advisory['base_warning_code']} "
-            f"{advisory['suggested_adjustment']:+d} → {advisory['adjusted_warning_code']} "
-            f"({advisory['adjusted_warning_level']})"
-        )
-        print(f"   理由：{advisory['adjustment_reason']}")
-        print(f"   存量口径：两融/流通市值 {advisory['rzrq_ratio_pct']:.2f}% {advisory['rzrq_ratio_level']}"
-              f" | 维持担保比例 {advisory['avg_maintain_ratio']}")
-        print(f"   增量口径：两融交易额占比 {advisory['rzrq_trade_ratio_pct']}%"
-              f"（窗口内 {advisory['rzrq_trade_ratio_trend']}"
-              f" {advisory['rzrq_trade_ratio_change_pp']}pp）"
-              f" | 融资净买入 {advisory['net_financing_buy_yi']} 亿")
     plot(df, output_dir)
     print_correlation(df)
-    print_financing_warning(df)
 
     # 8) 摘要
     cur = df["rzrqye_total"].iloc[-1] / 1e12

@@ -21,10 +21,18 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 BASE_URL = "https://www.csdata.cn"
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                 "Chrome/120.0.0.0 Safari/537.36",
+}
 LIST_PAGES = [
     "/cmsmc/cgfb/rzrqsj/rzrqscmrsjtj/index.html",
     "/cmsmc/cgfb/rzrqsj/rzrqsclssj/rzrqscmrsjtj/index.html",
@@ -47,7 +55,7 @@ FIELD_MAP = {
 
 def _fetch_page_links(url: str) -> list[dict]:
     """从列表页解析 xlsx 下载链接"""
-    resp = requests.get(url, timeout=15)
+    resp = requests.get(url, timeout=15, verify=False, headers=_HEADERS)
     resp.raise_for_status()
     pattern = re.compile(
         r'<span>(\d{4}-\d{2}-\d{2})</span>'
@@ -102,7 +110,7 @@ def fetch_csdata(days: int = 5) -> pd.DataFrame:
         url = BASE_URL + lk["href"]
         try:
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
-                resp = requests.get(url, timeout=15)
+                resp = requests.get(url, timeout=15, verify=False, headers=_HEADERS)
                 resp.raise_for_status()
                 f.write(resp.content)
                 tmp = f.name
