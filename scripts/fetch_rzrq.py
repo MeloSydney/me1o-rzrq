@@ -387,7 +387,7 @@ def merge_total(sh: pd.DataFrame, sz: pd.DataFrame,
 
 
 def plot(df: pd.DataFrame, output_dir: Path) -> Path:
-    """最近三年四子图交互式 HTML: 两融合计 / 融资余额 / 科创50 / 上证指数。
+    """最近一年四子图交互式 HTML: 两融合计 / 融资余额 / 科创50 / 上证指数。
 
     融资与指数拆成上下对齐的独立子图，避免双 Y 轴自动缩放造成视觉误读。
     鼠标悬停某日期时，沿共享 X 轴显示各子图的精确数值。
@@ -397,14 +397,16 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
     from plotly.subplots import make_subplots
 
     latest_date = pd.to_datetime(df["date"]).max()
-    chart_start = latest_date - pd.DateOffset(years=3)
+    chart_start = latest_date - pd.DateOffset(years=1)
     chart_df = df[pd.to_datetime(df["date"]) >= chart_start].copy()
     chart_df = chart_df.sort_values("date").reset_index(drop=True)
     chart_df["date"] = pd.to_datetime(chart_df["date"])
     dates = chart_df["date"]
-    y_total = chart_df["rzrqye_total"] / 1e12   # 万亿
-    y_rzye = chart_df["rzye_total"] / 1e12      # 万亿
+    y_total = chart_df["rzrqye_total"] / 1e8   # 亿
+    y_rzye = chart_df["rzye_total"] / 1e8      # 亿
     x0, x1 = chart_start, latest_date
+    _pad = (x1 - x0) * 0.02
+    ax0, ax1 = x0 - _pad, x1 + _pad  # 轴左右留缓冲，改善边缘悬停体验
 
     fig = make_subplots(
         rows=4, cols=1, shared_xaxes=True,
@@ -418,23 +420,23 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
     fig.add_trace(
         go.Scatter(x=dates, y=y_total, mode="lines", name="两融余额",
                    line=dict(color="#e74c3c", width=1.4),
-                   hovertemplate="两融余额 %{y:.2f} 万亿<extra></extra>"),
+                   hovertemplate="两融余额 %{y:,.0f} 亿<extra></extra>"),
         row=1, col=1, secondary_y=False)
     # 25%–75% 区间带
-    fig.add_shape(type="rect", x0=x0, x1=x1, y0=p25, y1=p75,
+    fig.add_shape(type="rect", x0=ax0, x1=ax1, y0=p25, y1=p75,
                   fillcolor="rgba(52,152,219,0.10)", line_width=0, layer="below",
                   row=1, col=1)
-    fig.add_annotation(x=x1, y=p75, text=f"25%–75% ({p25:.2f}–{p75:.2f} 万亿)",
+    fig.add_annotation(x=x1, y=p75, text=f"25%–75% ({p25:,.0f}–{p75:,.0f} 亿)",
                        xanchor="right", yanchor="bottom", showarrow=False,
                        font=dict(size=10, color="#3498db"), row=1, col=1)
     # 峰值水平虚线 + 标注
     peak_val, peak_idx = float(y_total.max()), int(y_total.idxmax())
     peak_date = dates.iloc[peak_idx]
-    fig.add_shape(type="line", x0=x0, x1=x1, y0=peak_val, y1=peak_val,
+    fig.add_shape(type="line", x0=ax0, x1=ax1, y0=peak_val, y1=peak_val,
                   line=dict(color="gray", width=1, dash="dash"), layer="below",
                   row=1, col=1)
     fig.add_annotation(x=peak_date, y=peak_val,
-                       text=f"峰值 {peak_val:.2f} 万亿 ({peak_date:%Y-%m-%d})",
+                       text=f"峰值 {peak_val:,.0f} 亿 ({peak_date:%Y-%m-%d})",
                        showarrow=True, arrowhead=2, arrowsize=0.6,
                        arrowcolor="gray", font=dict(size=11, color="gray"),
                        row=1, col=1)
@@ -442,14 +444,14 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
     cur_val = float(y_total.iloc[-1])
     fig.add_trace(go.Scatter(x=[dates.iloc[-1]], y=[cur_val], mode="markers",
                              name="当前", marker=dict(color="#e74c3c", size=8),
-                             hovertemplate=f"当前 {cur_val:.2f} 万亿<extra></extra>",
+                             hovertemplate=f"当前 {cur_val:,.0f} 亿<extra></extra>",
                              showlegend=False),
                   row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="两融余额（万亿元）", row=1, col=1)
+    fig.update_yaxes(title_text="两融余额（亿元）", tickformat=",.0f", row=1, col=1)
 
     # ── 子图2: 融资余额；子图3/4: 两个指数（独立上下子图）──
     def add_series(row: int, values: pd.Series, name: str, color: str,
-                   axis_title: str, hovertemplate: str) -> None:
+                   axis_title: str, hovertemplate: str, tickformat: str | None = None) -> None:
         """在独立子图绘制一条序列及其当前点。"""
         valid = values.notna()
         if not valid.any():
@@ -465,10 +467,10 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
                        mode="markers", marker=dict(color=color, size=7),
                        hovertemplate=hovertemplate, showlegend=False),
             row=row, col=1)
-        fig.update_yaxes(title_text=axis_title, color=color, row=row, col=1)
+        fig.update_yaxes(title_text=axis_title, color=color, tickformat=tickformat, row=row, col=1)
 
     add_series(2, y_rzye, "融资余额", "#2980b9",
-               "融资余额（万亿元）", "融资余额 %{y:.2f} 万亿<extra></extra>")
+               "融资余额（亿元）", "融资余额 %{y:,.0f} 亿<extra></extra>", tickformat=",.0f")
     if "star50_close" in chart_df.columns:
         add_series(3, chart_df["star50_close"], "科创50", "#e67e22",
                    "科创50（点）", "科创50 %{y:.0f} 点<extra></extra>")
@@ -476,19 +478,86 @@ def plot(df: pd.DataFrame, output_dir: Path) -> Path:
         add_series(4, chart_df["index_close"], "上证指数", "#8e44ad",
                    "上证指数（点）", "上证指数 %{y:.0f} 点<extra></extra>")
 
-    # ── 布局：最近三年逐月 X 轴，共享日期悬停 ──
+    # ── 布局：最近一年逐月 X 轴，共享日期悬停；边缘悬停优化 ──
     fig.update_layout(
         title_text="A 股杠杆水平：融资余额与科创50、上证指数分图对照",
         title_font_size=15, hovermode="x unified", hoversubplots="axis", height=980,
+        hoverdistance=-1, spikedistance=-1,
         legend=dict(orientation="h", xanchor="left", yanchor="bottom"),
         margin=dict(l=70, r=35, t=80, b=40), plot_bgcolor="white",
     )
-    fig.update_xaxes(range=[x0, x1], dtick="M1", tickformat="%Y-%m", tickangle=-60)
+    fig.update_xaxes(range=[ax0, ax1], dtick="M1", tickformat="%Y-%m", tickangle=-60,
+                     spikemode="across", spikesnap="cursor", spikethickness=1,
+                     spikedash="dot", spikecolor="rgba(0,0,0,0.35)")
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(0,0,0,0.08)")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "rzrq_leverage.html"
-    fig.write_html(str(path), include_plotlyjs=True, full_html=True)
+    # 悬停联动:原生 hoversubplots 只把十字线带到其余子图、数值仍只出现在光标所在子图。
+    # 这里用 plotly_hover 事件,在四个子图上各画一个数值标注,实现"悬停一处、四图同显该日数值"。
+    _hover_sync_js = r"""
+(function () {
+  var gd = document.querySelector('.js-plotly-plot');
+  if (!gd || !gd.on) return;
+  var staticAnn = (gd.layout && gd.layout.annotations ? gd.layout.annotations : []).slice();
+  var lastIdx = -1;
+
+  function lineTraces() {
+    var out = [];
+    for (var t = 0; t < gd.data.length; t++) {
+      var f = gd._fullData[t];
+      if (f && f.mode && f.mode.indexOf('lines') >= 0) out.push(t);
+    }
+    return out;
+  }
+  function fmt(v) { return Math.round(v).toLocaleString('en-US'); }
+
+  function build(idx, skipYref) {
+    var anns = staticAnn.slice();
+    var lts = lineTraces();
+    for (var k = 0; k < lts.length; k++) {
+      var ti = lts[k];
+      var fd = gd._fullData[ti];
+      if (skipYref && fd.yaxis === skipYref) continue; // 光标所在子图已由原生 tooltip 显示
+      var yv = fd.y ? fd.y[idx] : undefined;
+      if (yv == null || isNaN(yv)) continue;
+      var unit = ((fd.hovertemplate || '').indexOf('\u4ebf') >= 0) ? ' \u4ebf' : ' \u70b9';
+      anns.push({
+        x: fd.x[idx], y: yv, xref: fd.xaxis, yref: fd.yaxis,
+        text: (fd.name || '') + ' ' + fmt(yv) + unit,
+        showarrow: false, xanchor: 'left', yanchor: 'bottom', xshift: 8,
+        font: { size: 11, color: (fd.line && fd.line.color) || '#333' },
+        bgcolor: 'rgba(255,255,255,0.9)', bordercolor: 'rgba(0,0,0,0.18)',
+        borderwidth: 1, borderpad: 3
+      });
+    }
+    return anns;
+  }
+
+  gd.on('plotly_hover', function (ev) {
+    if (!ev || !ev.points || !ev.points.length) return;
+    var dateStr = ev.points[0].x;
+    var lts = lineTraces();
+    if (!lts.length) return;
+    var xs = gd._fullData[lts[0]].x;
+    var tgt = new Date(dateStr).getTime(), idx = 0, bd = Infinity;
+    for (var i = 0; i < xs.length; i++) {
+      var d = Math.abs(new Date(xs[i]).getTime() - tgt);
+      if (d < bd) { bd = d; idx = i; }
+    }
+    if (idx === lastIdx) return;
+    lastIdx = idx;
+    var skipYref = gd._fullData[ev.points[0].curveNumber] ? gd._fullData[ev.points[0].curveNumber].yaxis : null;
+    Plotly.relayout(gd, { annotations: build(idx, skipYref) });
+  });
+
+  gd.on('plotly_unhover', function () {
+    lastIdx = -1;
+    Plotly.relayout(gd, { annotations: staticAnn });
+  });
+})();
+"""
+    fig.write_html(str(path), include_plotlyjs=True, full_html=True, post_script=_hover_sync_js)
     print(f"📊 交互图表 → {path}")
     return path
 
